@@ -1,0 +1,56 @@
+l finit par se connecter, mais après quelques minutes » : ce symptôme oriente vers une attente qui finit par expirer, suivie d’un plan B qui réussit. Une durée de 1 à 3 minutes correspond typiquement à un délai TCP ou DNS. Par exemple, Linux abandonne un SYN sans réponse au bout d’environ 127 s (tcp_syn_retries = 6). Les causes ci-dessous sont classées de la plus probable à la moins probable.
+
+Causes probables
+
+1. PostgreSQL fait une résolution DNS inverse de l’IP du client (très fréquent)
+Si log_hostname = on, ou si pg_hba.conf contient des noms d’hôtes au lieu de CIDR, PostgreSQL cherche le nom associé à chaque IP de pod. Les IP de pods n’ont généralement pas d’enregistrement PTR, et chaque connexion attend l’expiration de la requête DNS.
+→ Mettez log_hostname = off et n’utilisez que des CIDR dans pg_hba.conf.
+
+2. Le nom de la base se résout d’abord en IPv6, ou vers une IP morte
+Si externalDatabaseHost renvoie un enregistrement AAAA, ou plusieurs A dont un pointe vers un ancien serveur (après une bascule), Java tente d’abord cette adresse. Il attend environ 2 min de timeout TCP, puis passe à l’IPv4 qui fonctionne.
+→ Testez avec l’IP à la place du nom. Pour forcer l’IPv4, ajoutez -Djava.net.preferIPv4Stack=true côté JVM.
+
+3. Résolution DNS lente dans le pod
+Avec ndots:5, la valeur par défaut de Kubernetes, un nom externe est d’abord cherché dans tous les domaines de recherche du cluster (.seeker.svc.cluster.local, .svc.cluster.local…). Si un DNS amont ne répond pas, chaque essai attend 5 s. Multiplié par le nombre de domaines et par les requêtes A et AAAA, cela fait vite plusieurs minutes.
+→ Utilisez un FQDN terminé par un point (pg.interne.fr.), ou réglez dnsConfig: options: [{name: ndots, value: "1"}].
+
+4. Le pare-feu jette les premiers SYN
+Limitation de débit, protection anti-SYN flood ou routage asymétrique : le SYN est renvoyé à 1, 3, 7, 15, 31 puis 63 s, et finit par passer.
+
+5. Méthode d’authentification lente
+pg_hba.conf utilise ldap, radius ou gss avec un serveur lent à répondre.
+
+6. Ce n’est pas la connexion, mais le démarrage de Seeker
+Démarrage de la JVM, migration du schéma après une montée de version, ou pod démarré avec les requests par défaut du chart (100m de CPU) parce que -f medium.yaml n’a pas été passé.
+
+Le test qui tranche (5 minutes)
+
+Depuis un pod de debug dans le namespace seeker :
+
+bash
+kubectl -n seeker run pgtest --rm -it --image=postgres:16 -- bash
+cat /etc/resolv.conf                                   # ndots, search, nameserver
+time getent ahosts <NOM_BASE>                          # lent ? IPv6 renvoyée ?
+time timeout 300 bash -c '</dev/tcp/<IP_VM>/5432'      # TCP avec l'IP
+time timeout 300 bash -c '</dev/tcp/<NOM_BASE>/5432'   # TCP avec le nom
+time psql "host=<IP_VM> dbname=seeker user=seeker sslmode=disable" -c "select 1"
+time psql "host=<IP_VM> dbname=seeker user=seeker sslmode=require" -c "select 1"
+
+Comment lire les résultats :
+
+Résultat	Cause
+getent lent	DNS dans le pod (cause 3)
+getent renvoie une IPv6 ou une IP inconnue	Cause 2
+TCP lent avec le nom, rapide avec l’IP	Causes 2 ou 3
+TCP lent même avec l’IP	Pare-feu ou réseau (cause 4)
+TCP rapide mais psql lent	Côté PostgreSQL (causes 1 ou 5), ou TLS/MTU si seule la version sslmode=require est lente
+Tout est rapide	Le problème vient du démarrage de Seeker (cause 6) : regardez les logs du pod
+
+Côté VM, pour confirmer une attente côté PostgreSQL :
+
+sql
+SHOW log_hostname;
+bash
+grep -vE '^\s*(#|$)' $PGDATA/pg_hba.conf    # des noms d'hôtes au lieu de CIDR ?
+
+Avec log_connections = on, comparez dans les logs PostgreSQL l’heure de connection received et celle de connection authorized. Si plusieurs secondes ou minutes les séparent, l’attente se passe dans PostgreSQL (DNS inverse ou authentification). Sinon, elle se passe avant l’arrivée de la connexion, côté réseau ou DNS du pod.
